@@ -87,6 +87,10 @@ public class Sistema {
 		                    // nas proximas versoes isto pode modificar
 
 		private Word[] m;   // m é o array de memória "física", CPU tem uma ref a m para acessar
+		// ======== MMU (tabela de paginas corrente) ========
+		private int[] pageTable; // tabela de páginas do processo atual (page -> frame)
+		private int tamPag;      // tamanho da página em palavras
+
 
 		private InterruptHandling ih;    // significa desvio para rotinas de tratamento de Int - se int ligada, desvia
 		private SysCallHandling sysCall; // significa desvio para tratamento de chamadas de sistema
@@ -118,15 +122,10 @@ public class Sistema {
 		}
 
 
-                                       // verificação de enderecamento 
-		private boolean legal(int e) { // todo acesso a memoria tem que ser verificado se é válido - 
-			                           // aqui no caso se o endereco é um endereco valido em toda memoria
-			if (e >= 0 && e < m.length) {
-				return true;
-			} else {
-				irpt = Interrupts.intEnderecoInvalido;    // se nao for liga interrupcao no meio da exec da instrucao
-				return false;
-			}
+                                       // verificação de enderecamento
+
+		private boolean legal(int e) {
+			return phys(e) >= 0;
 		}
 
 		private boolean testOverflow(int v) {             // toda operacao matematica deve avaliar se ocorre overflow
@@ -144,6 +143,32 @@ public class Sistema {
 			irpt = Interrupts.noInterrupt;                // reset da interrupcao registrada
 		}
 
+		//metodos MMU
+		public void setMMU(int[] _pageTable, int _tamPag) {
+			this.pageTable = _pageTable;
+			this.tamPag = _tamPag;
+		}
+
+		private int phys(int logical) {
+			if (logical < 0 || pageTable == null || tamPag <= 0) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			int page = logical / tamPag;
+			int off  = logical % tamPag;
+			if (page < 0 || page >= pageTable.length) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			int frame = pageTable[page];
+			int phys  = frame * tamPag + off;
+			if (phys < 0 || phys >= m.length) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			return phys;
+		}
+
 		public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima, 
 														  // esta devidamente setado
 			cpuStop = false;
@@ -152,7 +177,7 @@ public class Sistema {
 				// --------------------------------------------------------------------------------------------------
 				// FASE DE FETCH
 				if (legal(pc)) { // pc valido
-					ir = m[pc];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
+					ir =  m[phys(pc)];;  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
 					             // resto é dump de debug
 					if (debug) {
 						System.out.print("                                              regs: ");
@@ -178,34 +203,35 @@ public class Sistema {
 							break;
 						case LDD: // Rd <- [A]
 							if (legal(ir.p)) {
-								reg[ir.ra] = m[ir.p].p;
+								reg[ir.ra] = m[phys(ir.p)].p;
 								pc++;
 							}
 							break;
 						case LDX: // RD <- [RS] // NOVA
 							if (legal(reg[ir.rb])) {
-								reg[ir.ra] = m[reg[ir.rb]].p;
+								reg[ir.ra] = m[phys(reg[ir.rb])].p;
 								pc++;
 							}
 							break;
 						case STD: // [A] ← Rs
 							if (legal(ir.p)) {
-								m[ir.p].opc = Opcode.DATA;
-								m[ir.p].p = reg[ir.ra];
+								int __a = phys(ir.p);
+								m[__a].opc = Opcode.DATA;
+								m[__a].p = reg[ir.ra];
 								pc++;
-                                if (debug) 
-								    {   System.out.print("                                  ");   
-									    u.dump(ir.p,ir.p+1);							
-									}
+								if (debug) {
+									System.out.print("                                  ");
+									u.dump(__a, __a + 1);
 								}
+							}
 							break;
-						case STX: // [Rd] ←Rs
+						case STX: // [Rd] ← Rs
 							if (legal(reg[ir.ra])) {
-								m[reg[ir.ra]].opc = Opcode.DATA;
-								m[reg[ir.ra]].p = reg[ir.rb];
+								int __a = phys(reg[ir.ra]);
+								m[__a].opc = Opcode.DATA;
+								m[__a].p = reg[ir.rb];
 								pc++;
 							}
-							;
 							break;
 						case MOVE: // RD <- RS
 							reg[ir.ra] = reg[ir.rb];
@@ -243,7 +269,7 @@ public class Sistema {
 							pc = ir.p;
 							break;
 						case JMPIM: // PC <- [A]
-							      pc = m[ir.p].p;
+							pc = m[phys(ir.p)].p;
 							break;
 						case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
 							if (reg[ir.rb] > 0) {
@@ -287,28 +313,16 @@ public class Sistema {
 								pc++;
 							}
 							break;
-						case JMPIGM: // If RC > 0 then PC <- [A] else PC++
-						    if (legal(ir.p)){
-							    if (reg[ir.rb] > 0) {
-								   pc = m[ir.p].p;
-							    } else {
-								  pc++;
-							   }
-						    }
-							break;
-						case JMPILM: // If RC < 0 then PC <- k else PC++
-							if (reg[ir.rb] < 0) {
-								pc = m[ir.p].p;
-							} else {
-								pc++;
+						case JMPIGM:
+							if (legal(ir.p)) {
+								if (reg[ir.rb] > 0) { pc = m[phys(ir.p)].p; } else { pc++; }
 							}
 							break;
-						case JMPIEM: // If RC = 0 then PC <- k else PC++
-							if (reg[ir.rb] == 0) {
-								pc = m[ir.p].p;
-							} else {
-								pc++;
-							}
+						case JMPILM:
+							if (reg[ir.rb] < 0) { pc = m[phys(ir.p)].p; } else { pc++; }
+							break;
+						case JMPIEM:
+							if (reg[ir.rb] == 0) { pc = m[phys(ir.p)].p; } else { pc++; }
 							break;
 						case JMPIGT: // If RS>RC then PC <- k else PC++
 							if (reg[ir.ra] > reg[ir.rb]) {
@@ -362,6 +376,53 @@ public class Sistema {
 		public HW(int tamMem) {
 			mem = new Memory(tamMem);
 			cpu = new CPU(mem, true); // true liga debug
+		}
+	}
+
+	// ===== GM – Interface e Implementacao (paginacao) =====
+	private interface GM {
+		// Retorna a tabela de páginas (page -> frame) ou null se não houver frames suficientes
+		int[] aloca(int nroPalavras);
+		void desaloca(int[] tabelaPaginas);
+	}
+
+	private class GerenteMemoriaPaginado implements GM {
+		private final int tamPg;
+		private final int nFrames;
+		private final boolean[] livre;
+
+		GerenteMemoriaPaginado(int tamMem, int tamPg) {
+			this.tamPg = tamPg;
+			this.nFrames = tamMem / tamPg;
+			this.livre = new boolean[nFrames];
+			for (int i = 0; i < nFrames; i++) livre[i] = true;
+		}
+
+		@Override
+		public int[] aloca(int nroPalavras) {
+			int nPag = (nroPalavras + tamPg - 1) / tamPg;
+			int[] tabela = new int[nPag];
+			int j = 0;
+			for (int f = 0; f < nFrames && j < nPag; f++) {
+				if (livre[f]) {
+					livre[f] = false;
+					tabela[j++] = f;
+				}
+			}
+			if (j < nPag) { // rollback
+				for (int k = 0; k < j; k++) livre[tabela[k]] = true;
+				return null;
+			}
+			return tabela;
+		}
+
+		@Override
+		public void desaloca(int[] tabelaPaginas) {
+			if (tabelaPaginas == null) return;
+			for (int page = 0; page < tabelaPaginas.length; page++) {
+				int f = tabelaPaginas[page];
+				if (f >= 0 && f < nFrames) livre[f] = true;
+			}
 		}
 	}
 	// -------------------------------------------------------------------------------------------------------
@@ -429,11 +490,14 @@ public class Sistema {
 	// carga na memória
 	public class Utilities {
 		private HW hw;
+		private GM gm;
 
 		public Utilities(HW _hw) {
 			hw = _hw;
+			gm = new GerenteMemoriaPaginado(hw.mem.pos.length, TAM_PG);
 		}
 
+		//nao vai ser usado
 		private void loadProgram(Word[] p) {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
 			for (int i = 0; i < p.length; i++) {
@@ -441,6 +505,19 @@ public class Sistema {
 				m[i].ra = p[i].ra;
 				m[i].rb = p[i].rb;
 				m[i].p = p[i].p;
+			}
+		}
+
+		private void loadProgramPaged(Word[] p, int[] tabelaPaginas) {
+			Word[] m = hw.mem.pos;
+			for (int i = 0; i < p.length; i++) {
+				int page = i / TAM_PG;
+				int off  = i % TAM_PG;
+				int phys = tabelaPaginas[page] * TAM_PG + off;
+				m[phys].opc = p[i].opc;
+				m[phys].ra  = p[i].ra;
+				m[phys].rb  = p[i].rb;
+				m[phys].p   = p[i].p;
 			}
 		}
 
@@ -466,15 +543,38 @@ public class Sistema {
 			}
 		}
 
+		private void dumpLogical(int[] tabelaPaginas, int tamProg) {
+			Word[] m = hw.mem.pos;
+			for (int i = 0; i < tamProg; i++) {
+				int page = i / TAM_PG;
+				int off  = i % TAM_PG;
+				int phys = tabelaPaginas[page] * TAM_PG + off;
+				System.out.print(i);
+				System.out.print(":  ");
+				dump(m[phys]);
+			}
+		}
+
 		private void loadAndExec(Word[] p) {
-			loadProgram(p); // carga do programa na memoria
-			System.out.println("---------------------------------- programa carregado na memoria");
-			dump(0, p.length); // dump da memoria nestas posicoes
-			hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
+			int[] tabela = gm.aloca(p.length);
+			if (tabela == null) {
+				throw new RuntimeException("Memória insuficiente para carregar o programa.");
+			}
+
+			loadProgramPaged(p, tabela);
+			hw.cpu.setMMU(tabela, TAM_PG);
+
+			System.out.println("---------------------------------- programa carregado (paginado)");
+			dumpLogical(tabela, p.length);
+
+			hw.cpu.setContext(0);
 			System.out.println("---------------------------------- inicia execucao ");
-			hw.cpu.run(); // cpu roda programa ate parar
-			System.out.println("---------------------------------- memoria após execucao ");
-			dump(0, p.length); // dump da memoria com resultado
+			hw.cpu.run();
+
+			System.out.println("---------------------------------- memoria (logica) apos execucao ");
+			dumpLogical(tabela, p.length);
+
+			gm.desaloca(tabela);
 		}
 	}
 
@@ -497,6 +597,10 @@ public class Sistema {
 	public HW hw;
 	public SO so;
 	public Programs progs;
+
+	// ======== PARAMETRO DO GERENTE DE MEMORIA ========
+	// Tamanho da página em "palavras" (ajustável para seus testes)
+	private final int TAM_PG = 8;
 
 	public Sistema(int tamMem) {
 		hw = new HW(tamMem);           // memoria do HW tem tamMem palavras
