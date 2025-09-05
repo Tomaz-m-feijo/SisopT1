@@ -121,7 +121,9 @@ public class Sistema {
 			u = _u;                     // aponta para rotinas utilitárias - fazer dump da memória na tela
 		}
 
-
+		public void setDebug(boolean on) {
+			this.debug = on;
+		}
                                        // verificação de enderecamento
 
 		private boolean legal(int e) {
@@ -169,7 +171,7 @@ public class Sistema {
 			return phys;
 		}
 
-		public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima, 
+		public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima,
 														  // esta devidamente setado
 			cpuStop = false;
 			while (!cpuStop) {      // ciclo de instrucoes. acaba cfe resultado da exec da instrucao, veja cada caso.
@@ -492,6 +494,8 @@ public class Sistema {
 		private HW hw;
 		private GM gm;
 
+		public GM getGM() { return gm; }
+
 		public Utilities(HW _hw) {
 			hw = _hw;
 			gm = new GerenteMemoriaPaginado(hw.mem.pos.length, TAM_PG);
@@ -508,7 +512,7 @@ public class Sistema {
 			}
 		}
 
-		private void loadProgramPaged(Word[] p, int[] tabelaPaginas) {
+		public void loadProgramPaged(Word[] p, int[] tabelaPaginas) {
 			Word[] m = hw.mem.pos;
 			for (int i = 0; i < p.length; i++) {
 				int page = i / TAM_PG;
@@ -543,7 +547,7 @@ public class Sistema {
 			}
 		}
 
-		private void dumpLogical(int[] tabelaPaginas, int tamProg) {
+		public void dumpLogical(int[] tabelaPaginas, int tamProg) {
 			Word[] m = hw.mem.pos;
 			for (int i = 0; i < tamProg; i++) {
 				int page = i / TAM_PG;
@@ -582,13 +586,139 @@ public class Sistema {
 		public InterruptHandling ih;
 		public SysCallHandling sc;
 		public Utilities utils;
-
+		public GP gp;
 		public SO(HW hw) {
 			ih = new InterruptHandling(hw); // rotinas de tratamento de int
 			sc = new SysCallHandling(hw); // chamadas de sistema
 			hw.cpu.setAddressOfHandlers(ih, sc);
 			utils = new Utilities(hw);
+			gp = new GP(hw, utils);
 		}
+	}
+	public enum EstadoProc { READY, RUNNING, TERMINATED }
+
+	public class PCB {
+		public final int id;
+		public final String nome;
+		public final int[] tabelaPaginas;
+		public final int tamPag;
+		public final int tamLogico;     // quantas palavras lógicas reservadas ao processo
+		public int pc;                  // para evoluções futuras (ctx switch)
+		public EstadoProc estado;
+
+		public PCB(int id, String nome, int[] tabelaPaginas, int tamPag, int tamLogico) {
+			this.id = id;
+			this.nome = nome;
+			this.tabelaPaginas = tabelaPaginas;
+			this.tamPag = tamPag;
+			this.tamLogico = tamLogico;
+			this.pc = 0;
+			this.estado = EstadoProc.READY;
+		}
+	}
+
+	// ===== GP – Gerente de Processos =====
+	public class GP {
+		private final HW hw;
+		private final Utilities utils;
+		private final GM gm;
+
+		private java.util.Map<Integer, PCB> tabela = new java.util.LinkedHashMap<>();
+		private java.util.Queue<PCB> ready = new java.util.ArrayDeque<>();
+		private PCB running = null;
+		private int nextPid = 1;
+
+		public GP(HW hw, Utilities utils) {
+			this.hw = hw;
+			this.utils = utils;
+			this.gm = utils.getGM(); // reutiliza o mesmo GM da Utilities
+		}
+
+		// cria processo e coloca na fila de prontos
+		public Integer criaProcesso(String progName, Programs programs) {
+			Word[] img = programs.retrieveProgram(progName);
+			if (img == null) return null;
+
+			// tamanho lógico padrão = tamanho da imagem
+			int tamLogico = img.length;
+
+			// (opcional, mas recomendado p/ teu "PC"): reserva espaço lógico extra
+			// para endereços altos que ele usa (96..99). Assim não dá intEnderecoInvalido.
+			if ("PC".equals(progName) && tamLogico < 100) {
+				tamLogico = 100;
+			}
+
+			int[] tabelaPaginas = gm.aloca(tamLogico);
+			if (tabelaPaginas == null) return null;
+
+			utils.loadProgramPaged(img, tabelaPaginas);
+
+			int pid = nextPid++;
+			PCB pcb = new PCB(pid, progName, tabelaPaginas, TAM_PG, tamLogico);
+			tabela.put(pid, pcb);
+			ready.add(pcb);
+			return pid;
+		}
+
+		// desaloca e remove processo (de qualquer fila/estado)
+		public boolean desalocaProcesso(int pid) {
+			PCB pcb = tabela.get(pid);
+			if (pcb == null) return false;
+			// se estiver na ready, remove
+			ready.remove(pcb);
+			// se estiver rodando, "para"
+			if (running == pcb) {
+				running = null;
+			}
+			// libera memória e retira da tabela
+			gm.desaloca(pcb.tabelaPaginas);
+			tabela.remove(pid);
+			return true;
+		}
+
+		public void ps() {
+			System.out.println("PID  NOME        ESTADO    TAM_LOG");
+			for (PCB pcb : tabela.values()) {
+				System.out.printf("%-4d %-10s %-9s %d%n",
+						pcb.id, pcb.nome, pcb.estado, pcb.tamLogico);
+			}
+		}
+
+		public boolean dump(int pid) {
+			PCB pcb = tabela.get(pid);
+			if (pcb == null) return false;
+			System.out.println("=== PCB ===");
+			System.out.println("pid: " + pcb.id + "  nome: " + pcb.nome +
+					"  estado: " + pcb.estado + "  tamLogico: " + pcb.tamLogico);
+			System.out.println("tabelaPaginas (page->frame): " + java.util.Arrays.toString(pcb.tabelaPaginas));
+			System.out.println("=== Memória lógica do processo ===");
+			utils.dumpLogical(pcb.tabelaPaginas, pcb.tamLogico);
+			return true;
+		}
+
+		// executa o processo por id
+		public boolean exec(int pid) {
+			PCB pcb = tabela.get(pid);
+			if (pcb == null) return false;
+			running = pcb;
+			pcb.estado = EstadoProc.RUNNING;
+
+			// carrega a MMU e contexto
+			hw.cpu.setMMU(pcb.tabelaPaginas, pcb.tamPag);
+			hw.cpu.setContext(pcb.pc);
+
+			System.out.println("---------------------------------- inicia execucao (pid " + pid + ")");
+			hw.cpu.run();
+			System.out.println("---------------------------------- fim execucao (pid " + pid + ")");
+
+			// nesta fase, consideramos o processo encerrado (STOP) -> TERMINATED
+			pcb.estado = EstadoProc.TERMINATED;
+			running = null;
+			return true;
+		}
+
+		// utilitário para a shell
+		public boolean existe(int pid) { return tabela.containsKey(pid); }
 	}
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- S I S T E M A
@@ -599,8 +729,8 @@ public class Sistema {
 	public Programs progs;
 
 	// ======== PARAMETRO DO GERENTE DE MEMORIA ========
-	// Tamanho da página em "palavras" (ajustável para seus testes)
-	private final int TAM_PG = 8;
+	// Tamanho da página em "palavras"
+	private final int TAM_PG = 1000;
 
 	public Sistema(int tamMem) {
 		hw = new HW(tamMem);           // memoria do HW tem tamMem palavras
@@ -610,18 +740,88 @@ public class Sistema {
 	}
 
 	public void run() {
+		java.util.Scanner in = new java.util.Scanner(System.in);
+		System.out.println("SO pronto. Comandos: new <prog>, rm <pid>, ps, dump <pid>, dumpM <ini> <fim>, exec <pid>, traceOn, traceOff, exit");
+		while (true) {
+			System.out.print("> ");
+			String line;
+			try {
+				line = in.nextLine();
+			} catch (Exception e) {
+				break;
+			}
+			if (line == null) break;
+			line = line.trim();
+			if (line.isEmpty()) continue;
 
-		so.utils.loadAndExec(progs.retrieveProgram("fatorialV2"));
+			String[] t = line.split("\\s+");
+			String cmd = t[0];
 
-		// so.utils.loadAndExec(progs.retrieveProgram("fatorial"));
-		// fibonacci10,
-		// fibonacci10v2,
-		// progMinimo,
-		// fatorialWRITE, // saida
-		// fibonacciREAD, // entrada
-		// PB
-		// PC, // bubble sort
+			try {
+				switch (cmd) {
+					case "new": {
+						if (t.length < 2) { System.out.println("uso: new <nomeDePrograma>"); break; }
+						String nome = t[1];
+						Integer pid = so.gp.criaProcesso(nome, progs);
+						if (pid == null) System.out.println("Erro: memoria insuficiente ou programa inexistente.");
+						else System.out.println("Processo criado. pid " + pid);
+						break;
+					}
+					case "rm": {
+						if (t.length < 2) { System.out.println("uso: rm <pid>"); break; }
+						int pid = Integer.parseInt(t[1]);
+						boolean ok = so.gp.desalocaProcesso(pid);
+						System.out.println(ok ? "Removido." : "PID inexistente.");
+						break;
+					}
+					case "ps": {
+						so.gp.ps();
+						break;
+					}
+					case "dump": {
+						if (t.length < 2) { System.out.println("uso: dump <pid>"); break; }
+						int pid = Integer.parseInt(t[1]);
+						boolean ok = so.gp.dump(pid);
+						if (!ok) System.out.println("PID inexistente.");
+						break;
+					}
+					case "dumpM": {
+						if (t.length < 3) { System.out.println("uso: dumpM <ini> <fim>"); break; }
+						int ini = Integer.parseInt(t[1]);
+						int fim = Integer.parseInt(t[2]);
+						so.utils.dump(ini, fim);
+						break;
+					}
+					case "exec": {
+						if (t.length < 2) { System.out.println("uso: exec <pid>"); break; }
+						int pid = Integer.parseInt(t[1]);
+						boolean ok = so.gp.exec(pid);
+						if (!ok) System.out.println("PID inexistente.");
+						break;
+					}
+					case "traceOn": {
+						hw.cpu.setDebug(true);
+						System.out.println("Trace ON.");
+						break;
+					}
+					case "traceOff": {
+						hw.cpu.setDebug(false);
+						System.out.println("Trace OFF.");
+						break;
+					}
+					case "exit": {
+						System.out.println("Saindo.");
+						return;
+					}
+					default:
+						System.out.println("Comando desconhecido.");
+				}
+			} catch (Exception ex) {
+				System.out.println("Erro: " + ex.getMessage());
+			}
+		}
 	}
+
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
 	// -------------------------------------------------------------------------------------------------------
@@ -629,7 +829,7 @@ public class Sistema {
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
-		Sistema s = new Sistema(1024);
+		Sistema s = new Sistema(255555);
 		s.run();
 	}
 
@@ -654,8 +854,9 @@ public class Sistema {
 
 		public Word[] retrieveProgram(String pname) {
 			for (Program p : progs) {
-				if (p != null & p.name == pname)
+				if (p != null && p.name.equals(pname)) {
 					return p.image;
+				}
 			}
 			return null;
 		}
