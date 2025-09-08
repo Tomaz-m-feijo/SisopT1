@@ -71,7 +71,9 @@ public class Sistema {
 	}
 
 	public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow;
+		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow,
+		intClock,  // fim de fatia de tempo
+		intStop;   // processo executou STOP (syscall)
 	}
 
 	public class CPU {
@@ -82,6 +84,8 @@ public class Sistema {
 		private Word ir;    // instruction register,
 		private int[] reg;  // registradores da CPU
 		private Interrupts irpt; // durante instrucao, interrupcao pode ser sinalizada
+		private int timeSlice = 0; // quantum atual (em número de instruções)
+		private int ticks = 0;     // contador regressivo do quantum
 		                    // FIM CONTEXTO DA CPU: tudo que precisa sobre o estado de um processo para
 		                    // executa-lo
 		                    // nas proximas versoes isto pode modificar
@@ -112,6 +116,10 @@ public class Sistema {
 
 		}
 
+		public void setTimeSlice(int delta) {        // delta <= 0 => sem preempção por tempo
+			this.timeSlice = Math.max(0, delta);
+		}
+
 		public void setAddressOfHandlers(InterruptHandling _ih, SysCallHandling _sysCall) {
 			ih = _ih;                  // aponta para rotinas de tratamento de int
 			sysCall = _sysCall;        // aponta para rotinas de tratamento de chamadas de sistema
@@ -137,6 +145,18 @@ public class Sistema {
 			}
 			;
 			return true;
+		}
+		public int getPC() { return pc; }
+
+		public void copyRegsTo(int[] out) {          // copia os 10 registradores para 'out'
+			for (int i = 0; i < 10; i++) out[i] = reg[i];
+		}
+
+		//SOBRECARGA de setContext
+		public void setContext(int _pc, int[] regs) { // restaura PC + regs
+			pc = _pc;
+			for (int i = 0; i < 10; i++) reg[i] = (regs != null ? regs[i] : 0);
+			irpt = Interrupts.noInterrupt;
 		}
 
 		public void setContext(int _pc) {                 // usado para setar o contexto da cpu para rodar um processo
@@ -173,6 +193,7 @@ public class Sistema {
 
 		public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima,
 														  // esta devidamente setado
+			ticks = timeSlice;  // a cada run, recarrega a fatia
 			cpuStop = false;
 			while (!cpuStop) {      // ciclo de instrucoes. acaba cfe resultado da exec da instrucao, veja cada caso.
 
@@ -345,15 +366,22 @@ public class Sistema {
 							pc++;
 							break;
 
-						case STOP: // por enquanto, para execucao
-							sysCall.stop();
-							cpuStop = true;
+						case STOP: // STOP é uma syscall que termina o processo
+							sysCall.stop();                // (mensagem/efeito da syscall)
+							irpt = Interrupts.intStop;     // deixa a verificação de interrupção encerrar o run()
 							break;
 
 						// Inexistente
 						default:
 							irpt = Interrupts.intInstrucaoInvalida;
 							break;
+					}
+					// --- relógio de preempção por tempo ---
+					if (timeSlice > 0) {
+						ticks--;
+						if (ticks <= 0 && irpt == Interrupts.noInterrupt) {
+							irpt = Interrupts.intClock;   // sinaliza fim da fatia de tempo
+						}
 					}
 				}
 				// --------------------------------------------------------------------------------------------------
@@ -444,16 +472,27 @@ public class Sistema {
 	// ----------------------------------
 	public class InterruptHandling {
 		private HW hw; // referencia ao hw se tiver que setar algo
+		public volatile Interrupts lastIrpt = Interrupts.noInterrupt; //lembrar qual foi o ultimo interrupt
 
 		public InterruptHandling(HW _hw) {
 			hw = _hw;
 		}
 
 		public void handle(Interrupts irpt) {
-			// apenas avisa - todas interrupcoes neste momento finalizam o programa
-			System.out.println(
-					"                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
+			lastIrpt = irpt;
+			switch (irpt) {
+				case intClock:
+					System.out.println("                                               Interrupcao FIM-DE-QUANTUM");
+					break;
+				case intStop:
+					System.out.println("                                               Interrupcao STOP (fim de processo)");
+					break;
+				default:
+					// erros e afins
+					System.out.println("                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
+			}
 		}
+
 	}
 
 	// ------------------- C H A M A D A S D E S I S T E M A - rotinas de tratamento
@@ -605,6 +644,7 @@ public class Sistema {
 		public final int tamLogico;     // quantas palavras lógicas reservadas ao processo
 		public int pc;                  // para evoluções futuras (ctx switch)
 		public EstadoProc estado;
+		public final int[] regs = new int[10]; // contexto de registradores
 
 		public PCB(int id, String nome, int[] tabelaPaginas, int tamPag, int tamLogico) {
 			this.id = id;
@@ -619,6 +659,9 @@ public class Sistema {
 
 	// ===== GP – Gerente de Processos =====
 	public class GP {
+		private Thread schedThread;
+		private volatile boolean schedOn = false;
+		private int defaultQuantum = 5;
 		private final HW hw;
 		private final Utilities utils;
 		private final GM gm;
@@ -633,6 +676,78 @@ public class Sistema {
 			this.utils = utils;
 			this.gm = utils.getGM(); // reutiliza o mesmo GM da Utilities
 		}
+		private void saveContext(PCB pcb) {
+			pcb.pc = hw.cpu.getPC();
+			hw.cpu.copyRegsTo(pcb.regs);
+		}
+
+		private void restoreContext(PCB pcb) {
+			hw.cpu.setMMU(pcb.tabelaPaginas, pcb.tamPag);
+			hw.cpu.setContext(pcb.pc, pcb.regs);
+		}
+
+		public synchronized void schedOn(int quantum) { //ativa o scheduler
+			if (schedOn) return;
+			if (quantum > 0) defaultQuantum = quantum;
+			schedOn = true;
+			schedThread = new Thread(() -> {
+				while (schedOn) {
+					PCB pcb = ready.poll();
+					if (pcb == null) {
+						try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+						continue;
+					}
+					if (pcb.estado != EstadoProc.TERMINATED) {
+						stepRoundRobin(pcb, defaultQuantum);
+					}
+				}
+			}, "Scheduler");
+			schedThread.start();
+			System.out.println("Scheduler ON (quantum=" + defaultQuantum + ").");
+		}
+
+		public synchronized void schedOff() {
+			schedOn = false;
+			if (schedThread != null) schedThread.interrupt();
+			System.out.println("Scheduler OFF.");
+		}
+		private void stepRoundRobin(PCB pcb, int quantum) { //paço no round robin
+			running = pcb;
+			pcb.estado = EstadoProc.RUNNING;
+
+			restoreContext(pcb);
+			hw.cpu.setTimeSlice(quantum);         // 0 => sem preempção por tempo
+			so.ih.lastIrpt = Interrupts.noInterrupt;
+
+			System.out.println("---------------------------------- inicia execucao (pid " + pcb.id + ")");
+			hw.cpu.run();
+			System.out.println("---------------------------------- fim execucao (pid " + pcb.id + ")");
+
+			Interrupts motivo = so.ih.lastIrpt;
+			if (motivo == Interrupts.intClock) {          // preemptou por tempo
+				saveContext(pcb);
+				pcb.estado = EstadoProc.READY;
+				running = null;
+				ready.add(pcb);                            // volta ao fim da fila
+			} else { // STOP ou erro => termina
+				pcb.estado = EstadoProc.TERMINATED;
+				running = null;
+				gm.desaloca(pcb.tabelaPaginas);
+				tabela.remove(pcb.id);
+				System.out.println("Processo " + pcb.id + " finalizado. Motivo: " + motivo);
+			}
+		}
+
+		public void execAll(int quantum) {
+			if (quantum <= 0) quantum = 5; // default
+			while (!ready.isEmpty()) {
+				PCB pcb = ready.poll();
+				if (pcb == null) break;
+				if (pcb.estado == EstadoProc.TERMINATED) continue;
+				stepRoundRobin(pcb, quantum);
+			}
+		}
+
 
 		// cria processo e coloca na fila de prontos
 		public Integer criaProcesso(String progName, Programs programs) {
@@ -697,23 +812,15 @@ public class Sistema {
 		}
 
 		// executa o processo por id
-		public boolean exec(int pid) {
+		public boolean exec(int pid) { //faz uma etapa
 			PCB pcb = tabela.get(pid);
 			if (pcb == null) return false;
-			running = pcb;
-			pcb.estado = EstadoProc.RUNNING;
 
-			// carrega a MMU e contexto
-			hw.cpu.setMMU(pcb.tabelaPaginas, pcb.tamPag);
-			hw.cpu.setContext(pcb.pc);
-
-			System.out.println("---------------------------------- inicia execucao (pid " + pid + ")");
-			hw.cpu.run();
-			System.out.println("---------------------------------- fim execucao (pid " + pid + ")");
-
-			// nesta fase, consideramos o processo encerrado (STOP) -> TERMINATED
-			pcb.estado = EstadoProc.TERMINATED;
-			running = null;
+			// roda até terminar (sem preempção por tempo)
+			while (tabela.containsKey(pid)) {
+				stepRoundRobin(pcb, 0); // quantum = 0 => roda até STOP/erro
+				// se terminou, já foi desalocado dentro de stepRoundRobin
+			}
 			return true;
 		}
 
@@ -741,7 +848,7 @@ public class Sistema {
 
 	public void run() {
 		java.util.Scanner in = new java.util.Scanner(System.in);
-		System.out.println("SO pronto. Comandos: new <prog>, rm <pid>, ps, dump <pid>, dumpM <ini> <fim>, exec <pid>, traceOn, traceOff, exit");
+		System.out.println("SO pronto. Comandos: new <prog>, rm <pid>, ps, dump <pid>, dumpM <ini> <fim>, exec <pid>, traceOn, traceOff, execAll [quantum], schedOn [quantum], schedOff, exit");
 		while (true) {
 			System.out.print("> ");
 			String line;
@@ -812,6 +919,20 @@ public class Sistema {
 					case "exit": {
 						System.out.println("Saindo.");
 						return;
+					}
+					case "execAll": {
+						int q = (t.length >= 2 ? Integer.parseInt(t[1]) : 5);
+						so.gp.execAll(q);
+						break;
+					}
+					case "schedOn": {
+						int q = (t.length >= 2 ? Integer.parseInt(t[1]) : 5);
+						so.gp.schedOn(q);
+						break;
+					}
+					case "schedOff": {
+						so.gp.schedOff();
+						break;
 					}
 					default:
 						System.out.println("Comando desconhecido.");
