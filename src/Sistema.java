@@ -666,6 +666,8 @@ public class Sistema {
 		private final Utilities utils;
 		private final GM gm;
 
+		private java.io.PrintWriter logger;
+
 		private java.util.Map<Integer, PCB> tabela = new java.util.LinkedHashMap<>();
 		private java.util.Queue<PCB> ready = new java.util.ArrayDeque<>();
 		private PCB running = null;
@@ -675,6 +677,12 @@ public class Sistema {
 			this.hw = hw;
 			this.utils = utils;
 			this.gm = utils.getGM(); // reutiliza o mesmo GM da Utilities
+
+			try {
+				logger = new java.io.PrintWriter(new java.io.FileWriter("logSO.txt", true));
+			} catch (java.io.IOException e) {
+				throw new RuntimeException(e);
+			}
 		}
 		private void saveContext(PCB pcb) {
 			pcb.pc = hw.cpu.getPC();
@@ -685,6 +693,35 @@ public class Sistema {
 			hw.cpu.setMMU(pcb.tabelaPaginas, pcb.tamPag);
 			hw.cpu.setContext(pcb.pc, pcb.regs);
 		}
+
+		private void logTransicao(PCB pcb, String razao, EstadoProc estadoInicial, EstadoProc proximoEstado) {
+			if (logger == null || pcb == null) return;
+
+			StringBuilder sb = new StringBuilder();
+
+			sb.append(pcb.id).append('\t')
+					.append(pcb.nome).append('\t')
+					.append(razao).append('\t')
+					.append(estadoInicial == null ? "nulo" : estadoInicial.toString()).append('\t')
+					.append(proximoEstado == null ? "nulo" : proximoEstado.toString()).append('\t')
+					.append('{');
+
+			for (int pag = 0; pag < pcb.tabelaPaginas.length; pag++) {
+				int frame = pcb.tabelaPaginas[pag];
+				String onde = (frame >= 0 ? "mp" : "_"); // por enquanto so memoria principal
+				if (pag > 0) sb.append(", ");
+				sb.append('[')
+						.append(pag).append(',')
+						.append(frame).append(',')
+						.append(onde)
+						.append(']');
+			}
+			sb.append('}');
+
+			logger.println(sb.toString());
+			logger.flush();
+		}
+
 
 		public synchronized void schedOn(int quantum) { //ativa o scheduler
 			if (schedOn) return;
@@ -713,7 +750,11 @@ public class Sistema {
 		}
 		private void stepRoundRobin(PCB pcb, int quantum) { //paço no round robin
 			running = pcb;
+			EstadoProc estadoAnterior = pcb.estado;
 			pcb.estado = EstadoProc.RUNNING;
+
+			// pronto -> rodando
+			logTransicao(pcb, "escalona", estadoAnterior, pcb.estado);
 
 			restoreContext(pcb);
 			hw.cpu.setTimeSlice(quantum);         // 0 => sem preempção por tempo
@@ -727,10 +768,16 @@ public class Sistema {
 			if (motivo == Interrupts.intClock) {          // preemptou por tempo
 				saveContext(pcb);
 				pcb.estado = EstadoProc.READY;
+
+				logTransicao(pcb, "fatia tempo", estadoAnterior, pcb.estado);
+
 				running = null;
 				ready.add(pcb);                            // volta ao fim da fila
 			} else { // STOP ou erro => termina
 				pcb.estado = EstadoProc.TERMINATED;
+				// rodando -> terminado (STOP ou erro)
+				logTransicao(pcb, "fim", estadoAnterior, pcb.estado);
+
 				running = null;
 				gm.desaloca(pcb.tabelaPaginas);
 				tabela.remove(pcb.id);
@@ -770,6 +817,10 @@ public class Sistema {
 
 			int pid = nextPid++;
 			PCB pcb = new PCB(pid, progName, tabelaPaginas, TAM_PG, tamLogico);
+
+			// estado inicial "nulo" -> indo para READY
+			logTransicao(pcb, "criacao", null, pcb.estado);
+
 			tabela.put(pid, pcb);
 			ready.add(pcb);
 			return pid;
@@ -785,6 +836,13 @@ public class Sistema {
 			if (running == pcb) {
 				running = null;
 			}
+
+			EstadoProc estadoAnterior = pcb.estado;
+			pcb.estado = EstadoProc.TERMINATED;
+
+			// remoção explícita pelo usuário
+			logTransicao(pcb, "rm", estadoAnterior, pcb.estado);
+
 			// libera memória e retira da tabela
 			gm.desaloca(pcb.tabelaPaginas);
 			tabela.remove(pid);
