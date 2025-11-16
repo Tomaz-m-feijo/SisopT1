@@ -73,7 +73,8 @@ public class Sistema {
 	public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
 		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow,
 		intClock,  // fim de fatia de tempo
-		intStop;   // processo executou STOP (syscall)
+		intStop,   // processo executou STOP (syscall)
+		intIO,     // interrupcao de dispositivo de IO
 	}
 
 	public class CPU {
@@ -484,6 +485,9 @@ public class Sistema {
 				case intClock:
 					System.out.println("                                               Interrupcao FIM-DE-QUANTUM");
 					break;
+				case intIO:
+					System.out.println("                                               Interrupcao IO (dispositivo)");
+					break;
 				case intStop:
 					System.out.println("                                               Interrupcao STOP (fim de processo)");
 					break;
@@ -492,6 +496,7 @@ public class Sistema {
 					System.out.println("                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
 			}
 		}
+
 
 	}
 
@@ -510,18 +515,30 @@ public class Sistema {
 		}
 
 		public void handle() { // chamada de sistema 
-			                   // suporta somente IO, com parametros 
-							   // reg[8] = in ou out    e reg[9] endereco do inteiro
+			// reg[8] = in (1) ou out (2)    e reg[9] = endereco
 			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
 
-			if  (hw.cpu.reg[8]==1){
-				  // leitura ...
+			int oper = hw.cpu.reg[8];
+			int addr = hw.cpu.reg[9];
 
-			} else if (hw.cpu.reg[8]==2){
-				  // escrita - escreve o conteuodo da memoria na posicao dada em reg[9]
-				  System.out.println("OUT:   "+ hw.mem.pos[hw.cpu.reg[9]].p);
-			} else {System.out.println("  PARAMETRO INVALIDO"); }		
+			if (oper == 1 || oper == 2) {
+				PCB atual = so.gp.getRunning();
+				if (atual == null) {
+					System.out.println("  SYSCALL sem processo corrente.");
+					return;
+				}
+				// bloqueia processo e cria pedido de IO
+				so.gp.bloqueia(atual);
+				IORequest req = new IORequest(atual.id, oper, addr);
+				io.enqueue(req);                 // envia para dispositivo
+
+				// força interrupção de "clock" para o escalonador poder trocar de processo
+				hw.cpu.irpt = Interrupts.intClock;
+			} else {
+				System.out.println("  PARAMETRO INVALIDO");
+			}
 		}
+
 	}
 
 	// ------------------ U T I L I T A R I O S D O S I S T E M A
@@ -634,7 +651,7 @@ public class Sistema {
 			gp = new GP(hw, utils);
 		}
 	}
-	public enum EstadoProc { READY, RUNNING, TERMINATED }
+	public enum EstadoProc { READY, RUNNING, BLOCKED, TERMINATED, }
 
 	public class PCB {
 		public final int id;
@@ -666,10 +683,9 @@ public class Sistema {
 		private final Utilities utils;
 		private final GM gm;
 
-		private java.io.PrintWriter logger;
-
 		private java.util.Map<Integer, PCB> tabela = new java.util.LinkedHashMap<>();
 		private java.util.Queue<PCB> ready = new java.util.ArrayDeque<>();
+		private java.util.Queue<PCB> blocked = new java.util.ArrayDeque<>();
 		private PCB running = null;
 		private int nextPid = 1;
 
@@ -677,12 +693,6 @@ public class Sistema {
 			this.hw = hw;
 			this.utils = utils;
 			this.gm = utils.getGM(); // reutiliza o mesmo GM da Utilities
-
-			try {
-				logger = new java.io.PrintWriter(new java.io.FileWriter("logSO.txt", true));
-			} catch (java.io.IOException e) {
-				throw new RuntimeException(e);
-			}
 		}
 		private void saveContext(PCB pcb) {
 			pcb.pc = hw.cpu.getPC();
@@ -694,32 +704,28 @@ public class Sistema {
 			hw.cpu.setContext(pcb.pc, pcb.regs);
 		}
 
-		private void logTransicao(PCB pcb, String razao, EstadoProc estadoInicial, EstadoProc proximoEstado) {
-			if (logger == null || pcb == null) return;
+		public PCB getRunning() {
+			return running;
+		}
 
-			StringBuilder sb = new StringBuilder();
+		public void bloqueia(PCB pcb) {
+			if (pcb == null) return;
+			pcb.estado = EstadoProc.BLOCKED;
+			running = null;
+			blocked.add(pcb);
+		}
 
-			sb.append(pcb.id).append('\t')
-					.append(pcb.nome).append('\t')
-					.append(razao).append('\t')
-					.append(estadoInicial == null ? "nulo" : estadoInicial.toString()).append('\t')
-					.append(proximoEstado == null ? "nulo" : proximoEstado.toString()).append('\t')
-					.append('{');
-
-			for (int pag = 0; pag < pcb.tabelaPaginas.length; pag++) {
-				int frame = pcb.tabelaPaginas[pag];
-				String onde = (frame >= 0 ? "mp" : "_"); // por enquanto so memoria principal
-				if (pag > 0) sb.append(", ");
-				sb.append('[')
-						.append(pag).append(',')
-						.append(frame).append(',')
-						.append(onde)
-						.append(']');
+		public void ioCompleted(int pid) {
+			PCB pcb = tabela.get(pid);
+			if (pcb == null) {
+				return;
 			}
-			sb.append('}');
-
-			logger.println(sb.toString());
-			logger.flush();
+			// remove da fila de bloqueados, se estiver lá
+			blocked.remove(pcb);
+			if (pcb.estado != EstadoProc.TERMINATED) {
+				pcb.estado = EstadoProc.READY;
+				ready.add(pcb);
+			}
 		}
 
 
@@ -750,11 +756,7 @@ public class Sistema {
 		}
 		private void stepRoundRobin(PCB pcb, int quantum) { //paço no round robin
 			running = pcb;
-			EstadoProc estadoAnterior = pcb.estado;
 			pcb.estado = EstadoProc.RUNNING;
-
-			// pronto -> rodando
-			logTransicao(pcb, "escalona", estadoAnterior, pcb.estado);
 
 			restoreContext(pcb);
 			hw.cpu.setTimeSlice(quantum);         // 0 => sem preempção por tempo
@@ -765,19 +767,22 @@ public class Sistema {
 			System.out.println("---------------------------------- fim execucao (pid " + pcb.id + ")");
 
 			Interrupts motivo = so.ih.lastIrpt;
-			if (motivo == Interrupts.intClock) {          // preemptou por tempo
+			if (motivo == Interrupts.intClock) {          // fim de quantum OU bloqueio por IO
+				saveContext(pcb);
+				running = null;
+				if (pcb.estado == EstadoProc.BLOCKED) {
+					// já foi colocado na fila de bloqueados pela chamada de sistema
+				} else {
+					pcb.estado = EstadoProc.READY;
+					ready.add(pcb);                       // volta ao fim da fila
+				}
+			} else if (motivo == Interrupts.intIO) {      // interrupcao de dispositivo
 				saveContext(pcb);
 				pcb.estado = EstadoProc.READY;
-
-				logTransicao(pcb, "fatia tempo", estadoAnterior, pcb.estado);
-
 				running = null;
-				ready.add(pcb);                            // volta ao fim da fila
+				ready.add(pcb);                           // processo continua pronto
 			} else { // STOP ou erro => termina
 				pcb.estado = EstadoProc.TERMINATED;
-				// rodando -> terminado (STOP ou erro)
-				logTransicao(pcb, "fim", estadoAnterior, pcb.estado);
-
 				running = null;
 				gm.desaloca(pcb.tabelaPaginas);
 				tabela.remove(pcb.id);
@@ -817,10 +822,6 @@ public class Sistema {
 
 			int pid = nextPid++;
 			PCB pcb = new PCB(pid, progName, tabelaPaginas, TAM_PG, tamLogico);
-
-			// estado inicial "nulo" -> indo para READY
-			logTransicao(pcb, "criacao", null, pcb.estado);
-
 			tabela.put(pid, pcb);
 			ready.add(pcb);
 			return pid;
@@ -836,13 +837,6 @@ public class Sistema {
 			if (running == pcb) {
 				running = null;
 			}
-
-			EstadoProc estadoAnterior = pcb.estado;
-			pcb.estado = EstadoProc.TERMINATED;
-
-			// remoção explícita pelo usuário
-			logTransicao(pcb, "rm", estadoAnterior, pcb.estado);
-
 			// libera memória e retira da tabela
 			gm.desaloca(pcb.tabelaPaginas);
 			tabela.remove(pid);
@@ -885,6 +879,72 @@ public class Sistema {
 		// utilitário para a shell
 		public boolean existe(int pid) { return tabela.containsKey(pid); }
 	}
+	public class IORequest {
+		public final int pid;
+		public final int operacao; // 1 = IN, 2 = OUT
+		public final int endereco; // endereço (físico) em memória
+
+		public IORequest(int pid, int operacao, int endereco) {
+			this.pid = pid;
+			this.operacao = operacao;
+			this.endereco = endereco;
+		}
+	}
+
+	public class IODevice implements Runnable {
+		private final HW hw;
+		private final GP gp;
+		private final java.util.concurrent.BlockingQueue<IORequest> fila =
+				new java.util.concurrent.LinkedBlockingQueue<>();
+		private Thread thread;
+
+		public IODevice(HW hw, GP gp) {
+			this.hw = hw;
+			this.gp = gp;
+		}
+
+		public void start() {
+			thread = new Thread(this, "IODevice");
+			thread.start();
+		}
+
+		public void enqueue(IORequest req) {
+			fila.add(req);
+		}
+
+		@Override
+		public void run() {
+			while (true) {
+				try {
+					IORequest req = fila.take();        // espera pedido
+					// simula tempo de IO
+					try { Thread.sleep(100); } catch (InterruptedException ignored) {}
+
+					if (req.operacao == 1) {            // IN
+						// leitura "simulada": grava um valor qualquer na posição de memória
+						hw.mem.pos[req.endereco].opc = Opcode.DATA;
+						hw.mem.pos[req.endereco].p   = 999;
+						System.out.println("IN (async) pid=" + req.pid +
+								" -> mem[" + req.endereco + "] = " +
+								hw.mem.pos[req.endereco].p);
+					} else if (req.operacao == 2) {     // OUT
+						System.out.println("OUT (async) pid=" + req.pid +
+								"  valor=" + hw.mem.pos[req.endereco].p);
+					}
+
+					// sinaliza conclusão ao SO/CPU
+					gp.ioCompleted(req.pid);            // muda processo para READY
+					if (hw.cpu.irpt == Interrupts.noInterrupt) {
+						hw.cpu.irpt = Interrupts.intIO;
+					}
+				} catch (InterruptedException e) {
+					// término da thread de IO se for interrompida
+					break;
+				}
+			}
+		}
+	}
+
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- S I S T E M A
 	// --------------------------------------------------------------------
@@ -892,6 +952,7 @@ public class Sistema {
 	public HW hw;
 	public SO so;
 	public Programs progs;
+	private IODevice io;
 
 	// ======== PARAMETRO DO GERENTE DE MEMORIA ========
 	// Tamanho da página em "palavras"
@@ -902,6 +963,9 @@ public class Sistema {
 		so = new SO(hw);
 		hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
 		progs = new Programs();
+		// dispositivo de IO concorrente
+		io = new IODevice(hw, so.gp);
+		io.start();
 	}
 
 	public void run() {
