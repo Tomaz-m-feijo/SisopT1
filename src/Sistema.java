@@ -370,6 +370,7 @@ public class Sistema {
 						case STOP: // STOP é uma syscall que termina o processo
 							sysCall.stop();                // (mensagem/efeito da syscall)
 							irpt = Interrupts.intStop;     // deixa a verificação de interrupção encerrar o run()
+							//cpuStop = true;                // encerra o run atual
 							break;
 
 						// Inexistente
