@@ -1,4 +1,49 @@
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+
 public class Sistema {
+
+	// --------------------- Logger para escrita em arquivo ----------------------
+
+	public static class SystemLogger {
+		private static final String LOG_FILE = "sistema_log.txt";
+		private static PrintWriter writer;
+
+		public static void initialize() {
+			try {
+				// Usa FileWriter com 'false' para sobrescrever, e depois o writer
+				writer = new PrintWriter(new FileWriter(LOG_FILE, false));
+				System.out.println("Log de transições inicializado em: " + LOG_FILE);
+				logHeader();
+			} catch (IOException e) {
+				System.err.println("Erro ao inicializar o arquivo de log: " + e.getMessage());
+			}
+		}
+
+		private static void logHeader() {
+			if (writer != null) {
+				writer.println("PID | NOME DO PROG | RAZÃO DA MUDANÇA | ESTADO INICIAL | PROX. ESTADO | TABELA DE PÁGINAS");
+				writer.flush();
+			}
+		}
+
+		public static void log(String entry) {
+			if (writer != null) {
+				writer.println(entry);
+				writer.flush();
+			}
+		}
+
+		public static void close() {
+			if (writer != null) {
+				writer.close();
+			}
+		}
+	}
+
+
+	// --------------------- H A R D W A R E - definicoes de HW --------------------
 
 	public class Memory {
 		public Word[] pos;
@@ -503,6 +548,7 @@ public class Sistema {
 				frameTable[frameNum].isFree = true;
 				frameTable[frameNum].pid = -1;
 				frameTable[frameNum].pageNum = -1;
+				// CONTEÚDO DA MEMÓRIA PRESERVADO, APENAS O METADADO É LIBERADO
 			}
 		}
 
@@ -762,6 +808,35 @@ public class Sistema {
 				this.tabelaPaginas[i].diskBlockNum = i;
 			}
 		}
+
+		// Helper para o log de transição
+		public String getPageTableLog() {
+			StringBuilder sb = new StringBuilder("{ ");
+			for (int i = 0; i < tabelaPaginas.length; i++) {
+				PageTableEntry pte = tabelaPaginas[i];
+				String localizacao;
+				String frameInfo = "_";
+
+				if (pte.isPresent) {
+					localizacao = "mp";
+					frameInfo = String.valueOf(pte.frameNum);
+				} else if (pte.diskBlockNum != -1) {
+					localizacao = "ms";
+				} else {
+					localizacao = "nulo";
+				}
+
+				String dirtyInfo = pte.isDirty ? "D" : "";
+
+				// Formato: [pag, frame/_, onde esta]
+				sb.append(String.format("[%d,%s,%s%s]", i, frameInfo, localizacao, dirtyInfo));
+				if (i < tabelaPaginas.length - 1) {
+					sb.append(", ");
+				}
+			}
+			sb.append(" }");
+			return sb.toString();
+		}
 	}
 
 
@@ -790,6 +865,19 @@ public class Sistema {
 
 		public PCB getPCB(int pid) { return tabela.get(pid); }
 
+		private void logTransition(PCB pcb, String razao, EstadoProc estadoInicial, EstadoProc proximoEstado) {
+			String inicio = (estadoInicial == null) ? "nulo" : estadoInicial.toString().toLowerCase();
+			String proximo = (proximoEstado == null) ? "nulo" : proximoEstado.toString().toLowerCase();
+			String logEntry = String.format("%-4d | %-12s | %-16s | %-16s | %-12s | %s",
+					pcb.id,
+					pcb.nome,
+					razao,
+					inicio,
+					proximo,
+					pcb.getPageTableLog());
+			SystemLogger.log(logEntry);
+		}
+
 		private void saveContext(PCB pcb) {
 			pcb.pc = hw.cpu.getPC();
 			hw.cpu.copyRegsTo(pcb.regs);
@@ -806,9 +894,11 @@ public class Sistema {
 
 		public void bloqueia(PCB pcb) {
 			if (pcb == null) return;
+			EstadoProc estadoAnterior = pcb.estado;
 			pcb.estado = EstadoProc.BLOCKED;
 			running = null;
 			blocked.add(pcb);
+			logTransition(pcb, "syscall IO", estadoAnterior, EstadoProc.BLOCKED);
 		}
 
 		public void ioCompleted(int pid) {
@@ -819,6 +909,7 @@ public class Sistema {
 
 			blocked.remove(pcb);
 			if (pcb.estado != EstadoProc.TERMINATED) {
+				logTransition(pcb, "fim IO", EstadoProc.BLOCKED, EstadoProc.READY);
 				pcb.estado = EstadoProc.READY;
 				ready.add(pcb);
 			}
@@ -845,9 +936,11 @@ public class Sistema {
 			int frameNum = gm.allocateFrame(pcb.id, pageNum);
 
 
+			EstadoProc estadoAnterior = pcb.estado;
 			pcb.estado = EstadoProc.BLOCKED;
 			running = null;
 			blockedForVM.add(pcb);
+			logTransition(pcb, "pg fault", estadoAnterior, EstadoProc.BLOCKED);
 
 
 
@@ -875,6 +968,7 @@ public class Sistema {
 
 			if (blockedForVM.remove(pcb)) {
 				if (pcb.estado != EstadoProc.TERMINATED) {
+					logTransition(pcb, "fim pg fault", EstadoProc.BLOCKED, EstadoProc.READY);
 					pcb.estado = EstadoProc.READY;
 					ready.add(pcb);
 					System.out.println("GP: Page Fault (pid " + pid + ", pág " + pageNum + ") resolvido. Processo pronto.");
@@ -909,6 +1003,9 @@ public class Sistema {
 			System.out.println("Scheduler OFF.");
 		}
 		private void stepRoundRobin(PCB pcb, int quantum) {
+
+			logTransition(pcb, "escalona", EstadoProc.READY, EstadoProc.RUNNING);
+
 			running = pcb;
 			pcb.estado = EstadoProc.RUNNING;
 
@@ -927,11 +1024,13 @@ public class Sistema {
 				if (pcb.estado == EstadoProc.BLOCKED) {
 
 				} else {
+					logTransition(pcb, "fatia tempo", EstadoProc.RUNNING, EstadoProc.READY);
 					pcb.estado = EstadoProc.READY;
 					ready.add(pcb);
 				}
 			} else if (motivo == Interrupts.intIO) {
 				saveContext(pcb);
+				logTransition(pcb, "int. IO", EstadoProc.RUNNING, EstadoProc.READY);
 				pcb.estado = EstadoProc.READY;
 				running = null;
 				ready.add(pcb);
@@ -941,6 +1040,8 @@ public class Sistema {
 
 
 				} else {
+					String razao = (motivo == Interrupts.intStop) ? "termino (stop)" : "erro: " + motivo.name();
+					logTransition(pcb, razao, EstadoProc.RUNNING, EstadoProc.TERMINATED);
 					pcb.estado = EstadoProc.TERMINATED;
 					running = null;
 					gm.freeFrames(pcb.id, pcb.tabelaPaginas);
@@ -994,6 +1095,7 @@ public class Sistema {
 			pcb.tabelaPaginas[0].isPresent = true;
 
 			tabela.put(pid, pcb);
+			logTransition(pcb, "criacao", null, EstadoProc.READY);
 			ready.add(pcb);
 			return pid;
 		}
@@ -1006,6 +1108,9 @@ public class Sistema {
 			ready.remove(pcb);
 			blocked.remove(pcb);
 			blockedForVM.remove(pcb);
+
+			logTransition(pcb, "desaloca", pcb.estado, EstadoProc.TERMINATED);
+
 
 			if (running == pcb) {
 				running = null;
@@ -1257,6 +1362,9 @@ public class Sistema {
 	private final int TAM_PG = 16;
 
 	public Sistema(int tamMem) {
+		// Inicializa o logger primeiro
+		SystemLogger.initialize();
+
 		hw = new HW(tamMem);
 		progs = new Programs();
 		so = new SO(hw, progs);
@@ -1343,7 +1451,7 @@ public class Sistema {
 					}
 					case "exit": {
 						so.gp.schedOff();
-
+						SystemLogger.close();
 						System.out.println("Saindo.");
 						return;
 					}
@@ -1379,6 +1487,7 @@ public class Sistema {
 
 		Sistema s = new Sistema(1024);
 		s.run();
+		SystemLogger.close();
 	}
 
 
